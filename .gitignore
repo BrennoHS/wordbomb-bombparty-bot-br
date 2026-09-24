@@ -1,0 +1,5 @@
+__pycache__/
+config.json
+bot.log
+ocr_falhas/
+silabas_faltando*.json
