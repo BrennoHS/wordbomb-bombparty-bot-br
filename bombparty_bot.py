@@ -312,6 +312,8 @@ def main() -> None:
     ap.add_argument("--wpm-min", type=float, default=48, help="velocidade mínima (palavras/min)")
     ap.add_argument("--wpm-max", type=float, default=99, help="velocidade máxima (palavras/min)")
     ap.add_argument("--long-len", type=int, default=25, help="palavras com esse nº de letras ou mais usam o topo da faixa de WPM")
+    ap.add_argument("--reacao-min", type=float, default=0.35, help="pausa mínima (s) entre ver a sílaba e começar a digitar")
+    ap.add_argument("--reacao-max", type=float, default=0.9, help="pausa máxima (s) idem")
     ap.add_argument("--debug", action="store_true", help="mostra o que o OCR lê")
     args = ap.parse_args()
 
@@ -327,6 +329,7 @@ def main() -> None:
     active = True
     fail_reported = False
     fail_count = 0
+    retrying = False
     corrections: dict[str, str] = {}  # leitura errada -> certa (vale só nesta vez)
     print(f"{len(words)} palavras carregadas. F8 liga/desliga | F9 zera usadas | ESC sai")
 
@@ -344,6 +347,7 @@ def main() -> None:
             fail_reported = False
             fail_count = 0
             corrections.clear()
+            retrying = False
             continue
         syl, img = read_syllable(cfg["region"])
         if args.debug:
@@ -378,13 +382,26 @@ def main() -> None:
                 print(f"[{syl.upper()}] palavras dessa sílaba já usadas/recusadas")
             time.sleep(1)
             continue
+        # tempo de "ler a sílaba e pensar": mais curto ao repetir depois de uma recusa,
+        # e de vez em quando uma pausa maior (distração)
+        if retrying:
+            react = random.uniform(0.25, 0.6)
+        else:
+            react = random.uniform(args.reacao_min, args.reacao_max)
+            if random.random() < 0.12:
+                react += random.uniform(0.5, 1.2)
+        time.sleep(react)
+        if not is_my_turn(cfg):  # a vez passou enquanto "pensava"
+            continue
         used.add(word)
         print(f"[{syl.upper()}] -> {word}")
         type_word(word, args.wpm_min, args.wpm_max, args.long_len)
         keyboard.press_and_release("enter")
         event("digitou", syl, word)
         time.sleep(0.7)  # dá tempo do jogo passar a vez / rejeitar
+        retrying = False
         if is_my_turn(cfg) and read_syllable(cfg["region"])[0] == syl:
+            retrying = True
             event("recusada", syl, word)
             print(f"   ↳ jogo recusou '{word}' (anotada em bot.log)")
             # recusa em sequência pode ser sílaba lida errado: confirma por votação
