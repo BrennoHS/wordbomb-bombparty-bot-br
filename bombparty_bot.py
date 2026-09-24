@@ -312,8 +312,8 @@ def main() -> None:
     ap.add_argument("--wpm-min", type=float, default=48, help="velocidade mínima (palavras/min)")
     ap.add_argument("--wpm-max", type=float, default=99, help="velocidade máxima (palavras/min)")
     ap.add_argument("--long-len", type=int, default=25, help="palavras com esse nº de letras ou mais usam o topo da faixa de WPM")
-    ap.add_argument("--reacao-min", type=float, default=0.6, help="pausa mínima (s) entre ver a sílaba e começar a digitar")
-    ap.add_argument("--reacao-max", type=float, default=1.5, help="pausa máxima (s) idem")
+    ap.add_argument("--reacao-min", type=float, default=0.35, help="pausa mínima (s) entre ver a sílaba e começar a digitar")
+    ap.add_argument("--reacao-max", type=float, default=0.9, help="pausa máxima (s) idem")
     ap.add_argument("--debug", action="store_true", help="mostra o que o OCR lê")
     args = ap.parse_args()
 
