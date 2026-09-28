@@ -25,12 +25,21 @@ import mss
 import pytesseract
 from PIL import Image, ImageOps
 
+from formas import Moldes
+
 BASE = Path(__file__).parent
 CONFIG = BASE / "config.json"
 DEFAULT_DICT = BASE / "bomb-party-br.html"
 MISSING_LOG = BASE / "silabas_faltando.json"
 EVENT_LOG = BASE / "bot.log"
 FAIL_DIR = BASE / "ocr_falhas"
+PENDING_DIR = BASE / "moldes_pendentes"
+REVIEW_DIR = BASE / "revisao"                     # capturas da sessão para revisar no fim
+REFUSED_FILE = BASE / "palavras_recusadas.json"   # recusadas confirmadas na revisão
+
+MOLDES = Moldes()
+LEARN = True                     # aprende moldes das letras quando o OCR lê com segurança
+KNOWN_SYLLABLES: list[str] = []  # palavras normalizadas do dicionário (valida o que se aprende)
 
 # Caminho padrão do Tesseract no Windows (ajuste se instalou em outro lugar)
 TESSERACT_EXE = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -197,6 +206,8 @@ def resolve_letters(img: Image.Image) -> str:
         # duas leituras iguais (>= 2 letras) e coerentes com as formas: já basta
         if any(len(r) >= 2 and reads.count(r) >= 2 and len(r) == n for r in reads):
             break
+        if len(reads) == 1 and not wl and len(reads[0]) == n and n >= 2 and "L" not in reads[0]:
+            break  # leitura única coerente com as formas (caminho rápido)
     # leituras concordando entre si valem mais que a contagem de formas quando há
     # letras coladas (uma forma bem mais larga que alta)
     agreed = [r for r in reads if len(r) >= 2 and reads.count(r) >= 2]
@@ -216,27 +227,48 @@ def resolve_letters(img: Image.Image) -> str:
     return max(set(reads), key=reads.count) if reads else ""
 
 
-def recognize(img: Image.Image, thresh: int = 140) -> tuple[str, Image.Image]:
-    """img em tons de cinza (já recortada) -> (sílaba normalizada, imagem processada)."""
+def prepare(img: Image.Image, thresh: int = 140) -> Image.Image:
+    """Recorte em tons de cinza -> texto preto em fundo branco, ampliado e binarizado."""
     img = img.resize((img.width * 3, img.height * 3), Image.LANCZOS)
     # texto claro em fundo escuro -> inverte para texto escuro em fundo claro
     if sum(img.getdata()) / (img.width * img.height) < 128:
         img = ImageOps.invert(img)
     img = ImageOps.autocontrast(img)
     img = img.point(lambda v: 255 if v > thresh else 0)
-    img = ImageOps.expand(img, border=20, fill=255)
-    return norm(resolve_letters(img)), img
+    return ImageOps.expand(img, border=20, fill=255)
 
 
-def read_syllable(region: dict, thresh: int = 140) -> tuple[str, Image.Image]:
+def recognize(img: Image.Image, thresh: int = 140, learn: bool = False) -> tuple[str, Image.Image]:
+    """img em tons de cinza (já recortada) -> (sílaba normalizada, imagem processada).
+
+    1) tenta ler pelos moldes (rápido e exato); 2) se falhar, usa OCR e, com a leitura
+    segura, aprende os moldes para a próxima vez.
+    """
+    img = prepare(img, thresh)
+    blobs = segment(img)
+    separate = 2 <= len(blobs) <= 5 and not merged_blobs(img, blobs)
+    if 2 <= len(blobs) <= 5:
+        by_shape = MOLDES.read(img, blobs)
+        if by_shape:
+            return norm(by_shape), img
+    letters = resolve_letters(img)
+    syl = norm(letters)
+    if (LEARN and learn and separate and len(letters) == len(blobs)
+            and any(syl in w for w in KNOWN_SYLLABLES)):
+        if MOLDES.learn(img, blobs, letters.upper()):
+            MOLDES.save()
+    return syl, img
+
+
+def read_syllable(region: dict, thresh: int = 140, learn: bool = True) -> tuple[str, Image.Image]:
     with mss.mss() as sct:
         shot = sct.grab(region)
-    return recognize(Image.frombytes("RGB", shot.size, shot.rgb).convert("L"), thresh)
+    return recognize(Image.frombytes("RGB", shot.size, shot.rgb).convert("L"), thresh, learn)
 
 
 def vote_syllable(region: dict, first: str) -> str:
     """Re-lê com limiares diferentes e devolve a leitura mais frequente (tira erros de OCR)."""
-    reads = [first] + [read_syllable(region, th)[0] for th in (100, 120, 170, 190)]
+    reads = [first] + [read_syllable(region, th, learn=False)[0] for th in (100, 120, 170, 190)]
     reads = [r for r in reads if len(r) >= 2]
     return max(set(reads), key=reads.count) if reads else first
 
@@ -304,55 +336,342 @@ def log_missing(syl: str) -> None:
     MISSING_LOG.write_text(json.dumps(ordered, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def ascii_art(img: Image.Image, cols: int = 48) -> str:
+    """Desenho em texto da imagem processada (para você reconhecer a sílaba no terminal)."""
+    blobs = segment(img)
+    if not blobs:
+        return "(vazio)"
+    rows = [r for r in (ink_span(img, b) for b in blobs) if r]
+    box = (blobs[0][0], min(r[0] for r in rows), blobs[-1][1] + 1, max(r[1] for r in rows) + 1)
+    crop = img.crop(box)
+    h = max(1, int(cols * crop.height / crop.width * 0.5))
+    small = crop.resize((cols, h), Image.LANCZOS)
+    px = small.load()
+    return "\n".join("".join("#" if px[x, y] < 140 else " " for x in range(cols)) for y in range(h))
+
+
+def ink_span(img: Image.Image, blob: tuple[int, int]) -> tuple[int, int] | None:
+    px = img.load()
+    ys = [y for y in range(img.height) if any(px[x, y] < 128 for x in range(blob[0], blob[1] + 1))]
+    return (min(ys), max(ys)) if ys else None
+
+
+# ---------- revisão da sessão ----------
+def _review_index() -> list[dict]:
+    f = REVIEW_DIR / "indice.json"
+    return json.loads(f.read_text(encoding="utf-8")) if f.exists() else []
+
+
+def _review_save(items: list[dict]) -> None:
+    REVIEW_DIR.mkdir(exist_ok=True)
+    (REVIEW_DIR / "indice.json").write_text(json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def review_add(img: Image.Image, syl: str, word: str, result: str) -> int:
+    """Guarda a imagem lida e o que aconteceu, para você revisar no fim da sessão."""
+    items = _review_index()
+    rid = max((it["id"] for it in items), default=0) + 1
+    REVIEW_DIR.mkdir(exist_ok=True)
+    img.save(REVIEW_DIR / f"{rid:04d}.png")
+    items.append({"id": rid, "hora": time.strftime("%H:%M:%S"), "lida": syl, "palavra": word, "resultado": result})
+    _review_save(items)
+    return rid
+
+
+def review_update(rid: int, result: str) -> None:
+    items = _review_index()
+    for it in items:
+        if it["id"] == rid:
+            it["resultado"] = result
+    _review_save(items)
+
+
+def _ask_numbers(prompt: str, valid: set[int]) -> list[int]:
+    raw = input(prompt)
+    nums = [int(x) for x in re.findall(r"[0-9]+", raw)]
+    return [n for n in nums if n in valid]
+
+
+def _unlog_missing(syl: str) -> None:
+    if not MISSING_LOG.exists():
+        return
+    data = json.loads(MISSING_LOG.read_text(encoding="utf-8"))
+    if syl in data:
+        data[syl] -= 1
+        if data[syl] <= 0:
+            del data[syl]
+        MISSING_LOG.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def review_session() -> None:
+    """No fim da partida: você marca as sílabas que o bot leu errado (e diz quais eram)
+    e as recusas que não são culpa da palavra (ex.: você digitou junto)."""
+    items = _review_index()
+    if not items:
+        print("Nada para revisar nesta sessão.")
+        return
+    by_id = {it["id"]: it for it in items}
+    print("=== REVISÃO DA SESSÃO ===")
+    for it in items:
+        word = it["palavra"] or "-"
+        print(f"{it['id']:>3}) {it['hora']}  lida [{it['lida'].upper()}]  {word}  ({it['resultado']})")
+
+    # 1) sílabas lidas erradas
+    print()
+    wrong = _ask_numbers("Nº das leituras de SÍLABA que estavam ERRADAS (ex.: 3 7; Enter = nenhuma): ", set(by_id))
+    fixed: set[int] = set()
+    for n in wrong:
+        it = by_id[n]
+        img = Image.open(REVIEW_DIR / f"{n:04d}.png").convert("L")
+        blobs = segment(img)
+        print()
+        print(f"--- {n}) o bot leu [{it['lida'].upper()}] ---")
+        print(ascii_art(img))
+        text = re.sub(r"[^A-Za-z]", "", input("Que sílaba era? (Enter = não sei/pular) ")).upper()
+        if not text:
+            continue
+        fixed.add(n)
+        it["correta"] = text.lower()
+        if MOLDES.assign(img, blobs, text) is None:
+            print(f"  as {len(blobs)} formas não combinam com {text}; não ensinei os moldes, mas anotei a correção.")
+        else:
+            got = MOLDES.learn(img, blobs, text)
+            print(f"  ok, ensinei {got} molde(s) novo(s)." if got else "  ok (os moldes dessa sílaba já existiam).")
+        if it["resultado"] == "faltando":  # tira a leitura errada do log de sílabas faltando
+            _unlog_missing(it["lida"])
+            if not any(text.lower() in w for w in KNOWN_SYLLABLES):
+                log_missing(text.lower())
+    MOLDES.save()
+
+    # 2) recusas que não valem
+    refused = {n for n, it in by_id.items() if it["resultado"] == "recusada" and n not in fixed}
+    ignore: list[int] = []
+    if refused:
+        print()
+        print("Recusadas ainda consideradas culpa da PALAVRA: " + ", ".join(str(n) for n in sorted(refused)))
+        ignore = _ask_numbers("Nº das recusas que NÃO valem (ex.: você digitou junto; Enter = todas valem): ", refused)
+    confirmed = [by_id[n] for n in sorted(refused) if n not in ignore]
+    if confirmed:
+        old = json.loads(REFUSED_FILE.read_text(encoding="utf-8")) if REFUSED_FILE.exists() else []
+        seen = {(o["silaba"], o["palavra"]) for o in old}
+        for it in confirmed:
+            if (it["lida"], it["palavra"]) not in seen:
+                old.append({"silaba": it["lida"], "palavra": it["palavra"]})
+        REFUSED_FILE.write_text(json.dumps(old, ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"Recusadas confirmadas guardadas em {REFUSED_FILE.name}: " + ", ".join(it["palavra"] for it in confirmed))
+
+    # limpa a sessão revisada
+    for f in REVIEW_DIR.glob("*"):
+        f.unlink()
+    REVIEW_DIR.rmdir()
+    print("Revisão concluída.")
+
+
+def capture_pending(cfg: dict) -> None:
+    """F7: guarda a sílaba que está na tela para rotular depois (não interrompe o jogo)."""
+    with mss.mss() as sct:
+        shot = sct.grab(cfg["region"])
+    img = prepare(Image.frombytes("RGB", shot.size, shot.rgb).convert("L"))
+    PENDING_DIR.mkdir(exist_ok=True)
+    name = time.strftime("%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}.png"
+    img.save(PENDING_DIR / name)
+    print(f"  [F7] captura guardada ({len(list(PENDING_DIR.glob('*.png')))} pendente(s))")
+
+
+def label_pending() -> None:
+    """Mostra cada captura pendente em texto e pergunta que sílaba é; aprende os moldes."""
+    files = sorted(PENDING_DIR.glob("*.png")) if PENDING_DIR.exists() else []
+    if not files:
+        print("Nenhuma captura pendente.")
+        return
+    learned = 0
+    for i, path in enumerate(files, 1):
+        img = Image.open(path).convert("L")
+        blobs = segment(img)
+        print(f"\n--- Captura {i} de {len(files)} ({len(blobs)} formas) ---")
+        print(ascii_art(img))
+        text = re.sub(r"[^A-Za-z]", "", input("Que sílaba é? (Enter = descartar) ")).upper()
+        if text and MOLDES.assign(img, blobs, text) is None:
+            print(f"  as {len(blobs)} formas da imagem não combinam com {text}; descartei.")
+        elif text:
+            learned += MOLDES.learn(img, blobs, text)
+        path.unlink()
+    MOLDES.save()
+    print(f"\nOK: {learned} molde(s) novo(s). Letras conhecidas: {MOLDES.letters_known()}/26 ({MOLDES.summary()})")
+
+
+def teach_many(cfg: dict) -> None:
+    """Só ensinar (sem digitar): F7 guarda a tela; ESC termina e você rotula."""
+    print("Jogue normalmente. F7 guarda a sílaba da tela; ESC termina e aí você rotula cada captura.")
+    while not keyboard.is_pressed("esc"):
+        if keyboard.is_pressed("f7"):
+            capture_pending(cfg)
+            while keyboard.is_pressed("f7"):
+                time.sleep(0.02)
+        time.sleep(0.02)
+    label_pending()
+
+
+def teach(cfg: dict, text: str) -> None:
+    """Aprende as letras de `text` a partir da sílaba mostrada na tela agora (sem OCR)."""
+    text = re.sub(r"[^A-Za-z]", "", text).upper()
+    print(f"Vá para o jogo e, QUANDO A SÍLABA {text} ESTIVER NA TELA, aperte F7. (ESC cancela)")
+    while True:
+        if keyboard.is_pressed("esc"):
+            sys.exit("Cancelado.")
+        if keyboard.is_pressed("f7"):
+            break
+        time.sleep(0.02)
+    with mss.mss() as sct:
+        shot = sct.grab(cfg["region"])
+    img = prepare(Image.frombytes("RGB", shot.size, shot.rgb).convert("L"))
+    blobs = segment(img)
+    if MOLDES.assign(img, blobs, text) is None:
+        sys.exit(f"Vi {len(blobs)} formas na tela, que não combinam com {text}. Nada foi salvo; rode de novo.")
+    new = MOLDES.learn(img, blobs, text)
+    MOLDES.save()
+    print(f"OK: {new} molde(s) novo(s). Letras conhecidas: {MOLDES.letters_known()}/26 ({MOLDES.summary()})")
+
+
+def confident_letters(img: Image.Image) -> tuple[str, list[tuple[int, int]]] | None:
+    """Leitura por OCR só se 3 leituras diferentes concordam e batem com o nº de letras."""
+    blobs = segment(img)
+    if not 2 <= len(blobs) <= 5 or merged_blobs(img, blobs):
+        return None
+    reads = [ocr_text(img, 8, False), ocr_text(img, 7, False), ocr_text(img, 13, False)]
+    first = reads[0]
+    if len(first) == len(blobs) and all(r == first for r in reads):
+        return first, blobs
+    return None
+
+
+def learn_mode(cfg: dict, free: bool = False) -> None:
+    """Observa a região da sílaba (de qualquer jogador) e vai aprendendo os moldes.
+
+    Com free=True não exige que a sílaba exista no dicionário (útil em sala de outro idioma),
+    mas só aprende quando o OCR concorda em todas as leituras.
+    """
+    print("Modo aprender" + (" (livre)" if free else "") + ": deixe uma partida rolando. Não digita nada. ESC para sair.")
+    last = ""
+    while not keyboard.is_pressed("esc"):
+        time.sleep(0.25)
+        before = MOLDES.letters_known(), sum(len(v) for v in MOLDES.data.values())
+        if free:
+            with mss.mss() as sct:
+                shot = sct.grab(cfg["region"])
+            img = prepare(Image.frombytes("RGB", shot.size, shot.rgb).convert("L"))
+            blobs = segment(img)
+            syl = MOLDES.read(img, blobs) if 2 <= len(blobs) <= 5 else None
+            if not syl:
+                got = confident_letters(img)
+                if got:
+                    syl = got[0]
+                    if MOLDES.learn(img, got[1], syl):
+                        MOLDES.save()
+            syl = (syl or "").lower()
+        else:
+            syl, _ = read_syllable(cfg["region"])
+        after = MOLDES.letters_known(), sum(len(v) for v in MOLDES.data.values())
+        if syl != last and len(syl) >= 2:
+            last = syl
+            note = " (aprendeu)" if after != before else ""
+            print(f"[{syl.upper()}]{note}  letras: {after[0]}/26, moldes: {after[1]}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--calibrar", action="store_true")
     ap.add_argument("--dict", type=Path, default=DEFAULT_DICT)
     ap.add_argument("--max-len", type=int, default=999, help="limite de letras (sem limite por padrão)")
-    ap.add_argument("--wpm-min", type=float, default=48, help="velocidade mínima (palavras/min)")
-    ap.add_argument("--wpm-max", type=float, default=99, help="velocidade máxima (palavras/min)")
+    ap.add_argument("--wpm-min", type=float, default=58, help="velocidade mínima (palavras/min)")
+    ap.add_argument("--wpm-max", type=float, default=110, help="velocidade máxima (palavras/min)")
     ap.add_argument("--long-len", type=int, default=25, help="palavras com esse nº de letras ou mais usam o topo da faixa de WPM")
-    ap.add_argument("--reacao-min", type=float, default=0.35, help="pausa mínima (s) entre ver a sílaba e começar a digitar")
-    ap.add_argument("--reacao-max", type=float, default=0.9, help="pausa máxima (s) idem")
+    ap.add_argument("--reacao-min", type=float, default=0.5, help="tempo mínimo (s) desde que a vez começou até a 1ª tecla")
+    ap.add_argument("--reacao-max", type=float, default=0.9, help="tempo máximo (s) desde que a vez começou até a 1ª tecla")
+    ap.add_argument("--aprender", action="store_true", help="só observa a tela e aprende os moldes das letras (não digita)")
+    ap.add_argument("--livre", action="store_true", help="com --aprender: aprende sem exigir que a sílaba exista no dicionário (ex.: salas em inglês); só aceita leituras em que o OCR concorda consigo mesmo")
+    ap.add_argument("--ensinar", nargs="?", const="", metavar="SILABA", help="ensina os moldes: sem argumento, aperte F7 a cada sílaba que quiser guardar e rotule no fim; com a sílaba (ex.: --ensinar JU), captura uma só")
+    ap.add_argument("--revisar", action="store_true", help="revisa a última sessão: marque as sílabas lidas erradas e as recusas que não valem")
+    ap.add_argument("--rotular", action="store_true", help="rotula as capturas de F7 guardadas durante o jogo e aprende os moldes")
+    ap.add_argument("--sem-moldes", action="store_true", help="desliga moldes/aprendizado e usa só OCR")
     ap.add_argument("--debug", action="store_true", help="mostra o que o OCR lê")
     args = ap.parse_args()
 
     if args.calibrar:
         calibrate()
         return
+    if args.rotular:
+        label_pending()
+        return
+    if args.revisar:
+        KNOWN_SYLLABLES.extend(norm(w) for w in load_words(args.dict))
+        review_session()
+        return
     if not CONFIG.exists():
         sys.exit("Rode primeiro:  python bombparty_bot.py --calibrar")
 
     cfg = json.loads(CONFIG.read_text())
     words = load_words(args.dict)
+    KNOWN_SYLLABLES.extend(norm(w) for w in words)
+    if args.sem_moldes:
+        global LEARN
+        LEARN = False
+        MOLDES.data.clear()
+    else:
+        print(f"moldes de letras: {MOLDES.letters_known()}/26 ({MOLDES.summary()})")
+    if args.aprender:
+        learn_mode(cfg, args.livre)
+        return
+    if args.ensinar is not None:
+        teach(cfg, args.ensinar) if args.ensinar else teach_many(cfg)
+        return
     used: set[str] = set()
     active = True
     fail_reported = False
     fail_count = 0
     retrying = False
+    turn_started: float | None = None
+    grace_until = 0.0
+    last_missing: tuple | None = None
+    last_syl = ""
+    last_exhausted: tuple | None = None
+    rid = 0
     corrections: dict[str, str] = {}  # leitura errada -> certa (vale só nesta vez)
-    print(f"{len(words)} palavras carregadas. F8 liga/desliga | F9 zera usadas | ESC sai")
+    print(f"{len(words)} palavras carregadas. F7 guarda sílaba p/ ensinar | F8 liga/desliga | F9 zera usadas | ESC sai")
 
     def toggle():
         nonlocal active
         active = not active
         print("BOT", "LIGADO" if active else "PAUSADO")
 
+    keyboard.add_hotkey("f7", lambda: capture_pending(cfg))
     keyboard.add_hotkey("f8", toggle)
     keyboard.add_hotkey("f9", lambda: (used.clear(), print("Lista de usadas zerada.")))
 
     while not keyboard.is_pressed("esc"):
-        time.sleep(0.15)
+        time.sleep(0.05)
         if not active or not is_my_turn(cfg):
-            fail_reported = False
-            fail_count = 0
-            corrections.clear()
-            retrying = False
+            # logo após uma recusa a caixa "pisca": nesse intervalo não zera o estado
+            if time.time() >= grace_until:
+                turn_started = None
+                fail_reported = False
+                fail_count = 0
+                corrections.clear()
+                retrying = False
             continue
+        new_turn = turn_started is None
+        if new_turn:
+            turn_started = time.time()
         syl, img = read_syllable(cfg["region"])
+        if new_turn:
+            print(f"--- sua vez: [{syl.upper() or '?'}]")
         if args.debug:
             print("OCR:", repr(syl))
         syl = corrections.get(syl, syl)
+        if len(syl) >= 2:
+            if last_syl and syl != last_syl and not retrying:
+                turn_started = time.time()  # sílaba nova = vez nova (ex.: bomba explodiu na sala solo)
+            last_syl = syl
         if len(syl) < 2:
             fail_count += 1
             if fail_count >= 3 and not fail_reported:  # ignora transições rápidas
@@ -374,34 +693,50 @@ def main() -> None:
                 word = best_word(words, syl, used, args.max_len)
         if not word:
             if not any(syl in norm(w) for w in words):
-                log_missing(syl)
-                event("faltando", syl)
-                print(f"[{syl.upper()}] NÃO EXISTE no dicionário (registrada em {MISSING_LOG.name})")
+                if last_missing != (turn_started, syl):
+                    last_missing = (turn_started, syl)
+                    log_missing(syl)
+                    event("faltando", syl)
+                    review_add(img, syl, "", "faltando")
+                    print(f"[{syl.upper()}] NÃO EXISTE no dicionário (registrada em {MISSING_LOG.name})")
             else:
+                if last_exhausted != (turn_started, syl):
+                    last_exhausted = (turn_started, syl)
+                    review_add(img, syl, "", "esgotada")
                 event("esgotada", syl)
                 print(f"[{syl.upper()}] palavras dessa sílaba já usadas/recusadas")
             time.sleep(1)
             continue
-        # tempo de "ler a sílaba e pensar": mais curto ao repetir depois de uma recusa,
-        # e de vez em quando uma pausa maior (distração)
+        # Tempo de "ler a sílaba e pensar": é um ORÇAMENTO contado desde que a vez começou,
+        # então o tempo gasto em OCR/decisão já conta (não soma por cima).
         if retrying:
-            react = random.uniform(0.25, 0.6)
+            wait = random.uniform(0.15, 0.3)
         else:
-            react = random.uniform(args.reacao_min, args.reacao_max)
-            if random.random() < 0.12:
-                react += random.uniform(0.5, 1.2)
-        time.sleep(react)
+            budget = random.uniform(args.reacao_min, args.reacao_max)
+            if random.random() < 0.08:  # às vezes demora um pouco mais
+                budget += random.uniform(0.2, 0.4)
+            wait = budget - (time.time() - turn_started)
+        if wait > 0:
+            time.sleep(wait)
         if not is_my_turn(cfg):  # a vez passou enquanto "pensava"
+            event("vez_perdida", syl)
+            print(f"[{syl.upper()}] a vez passou antes de digitar")
             continue
         used.add(word)
         print(f"[{syl.upper()}] -> {word}")
+        latency = int((time.time() - turn_started) * 1000)
         type_word(word, args.wpm_min, args.wpm_max, args.long_len)
         keyboard.press_and_release("enter")
-        event("digitou", syl, word)
+        event("digitou", syl, f"{word} (1ª tecla após {latency} ms)")
+        rid = review_add(img, syl, word, "digitou")
         time.sleep(0.7)  # dá tempo do jogo passar a vez / rejeitar
         retrying = False
-        if is_my_turn(cfg) and read_syllable(cfg["region"])[0] == syl:
+        turn_started = None  # se aceitou, a próxima vez (mesmo seguida, sala solo) reinicia o relógio
+        if read_syllable(cfg["region"])[0] == syl:
             retrying = True
+            review_update(rid, "recusada")
+            turn_started = time.time()  # recusada: continua a mesma vez (o relógio recomeça agora)
+            grace_until = time.time() + 1.5
             event("recusada", syl, word)
             print(f"   ↳ jogo recusou '{word}' (anotada em bot.log)")
             # recusa em sequência pode ser sílaba lida errado: confirma por votação
@@ -410,6 +745,12 @@ def main() -> None:
                 corrections[syl] = voted
                 event("ocr_corrigida", syl, voted)
                 print(f"   ↳ OCR corrigido [{syl.upper()}] -> [{voted.upper()}]")
+
+    print()
+    review_session()
+    if PENDING_DIR.exists() and any(PENDING_DIR.glob("*.png")):
+        print("\nHá capturas de F7 pendentes. Rotulando agora (Enter descarta a captura):")
+        label_pending()
 
 
 if __name__ == "__main__":

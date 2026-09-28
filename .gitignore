@@ -3,3 +3,7 @@ config.json
 bot.log
 ocr_falhas/
 silabas_faltando*.json
+historico/
+moldes_pendentes/
+revisao/
+palavras_recusadas.json
